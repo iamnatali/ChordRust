@@ -3,10 +3,15 @@ use std::borrow::Cow; // COW == clone-on-write
 use std::net::{SocketAddrV4, Ipv4Addr};
 use std::collections::BTreeMap;
 use rand::Rng;
+use stateright::actor::register::{
+    RegisterActor, RegisterMsg, RegisterMsg::*};
+use std::sync::Arc;
 
 //Id - тип по которому можно обращаться
 type CircleId = u16; //123435, 32432434 (зашит хэш ip)
 type FingerId = u16; //1, 2, 3 1<=id<=m
+type RequestId = u64; //для registerActor
+type Value = char; //для registerActor
 
 struct InitializingParams{
     predecessor: NodeInfo,
@@ -14,7 +19,6 @@ struct InitializingParams{
 }
 
 struct NodeActor {
-    bootstrap: Option<(Id, NodeMessage)>,
     circle_id: CircleId,
     init: Option<InitializingParams>
 }
@@ -22,24 +26,30 @@ struct NodeActor {
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 struct NodeInfo {id: Id, circle_id: CircleId}
 
+type PredecessorAsker = Id;
+type SuccessorAsker = Id;
+type RegisterAsker = Id;
+
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 enum NodeMessage{
     FindPredecessor(
-        CircleId, //id
-        Id, //asker
-        Option<Id>, //successorAsker
+        CircleId, //queried_id
+        PredecessorAsker, //asker
+        Option<SuccessorAsker>, //successor_asker
+        Option<(RegisterAsker, RequestId)>, //register_asker
         Option<CircleId> //additional info
     ),
     FoundPredecessor(
-        CircleId, //queryId
+        CircleId, //queried_id
         NodeInfo, //predecessor
-        NodeInfo,//predecessorSuccessor
-        Option<Id>,//asker
+        NodeInfo,//predecessor_successor
+        Option<SuccessorAsker>,//successor_asker
+        Option<(RegisterAsker, RequestId)>, //register_asker
         Option<CircleId> //additional info
     ),
 
-    FindSuccessor(CircleId, Id, Option<CircleId>),//_, _, additional info 
-    Successor(NodeInfo, NodeInfo, Option<CircleId>), //result, predecessor, additional info 
+    FindSuccessor(CircleId, Option<SuccessorAsker>, Option<(RegisterAsker, RequestId)>, Option<CircleId>),//queried_id, asker, register_node, additional info 
+    FoundSuccessor(NodeInfo, NodeInfo, Option<CircleId>), //result, predecessor, additional info 
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -108,14 +118,11 @@ impl NodeActor{
 }
 
 impl Actor for NodeActor {
-    type Msg = NodeMessage;
+    type Msg = RegisterMsg<RequestId, Value, NodeMessage>;
     type State = Option<NodeState>;
 
     fn on_start(&self, _id: Id, _o: &mut Out<Self>) -> Self::State {
         if let Some(init_params) = &self.init {
-            if let Some((to, mes)) = &self.bootstrap{
-                _o.send(*to, *mes);
-            }
             Some(NodeState{
                 predecessor : init_params.predecessor,
                 behavior : &"internalReceive",
@@ -130,33 +137,39 @@ impl Actor for NodeActor {
         if let Some(current_state) = mut_state {
             match current_state.behavior {
                 "internalReceive" => match msg {
-                    //find part
-                    NodeMessage::FindSuccessor(circle_id, asker, add_info) => {
-                        o.send(_id, NodeMessage::FindPredecessor(circle_id, _id,  Some(asker), add_info));
+                    //сделать так, чтобы значение правда хранилось
+                    Get(request_id) => {
+                        o.send(src, GetOk(request_id, 'A'));
                     }
-                    NodeMessage::FindPredecessor(id, asker, successor_asker, add_info) => {
-                        if id == self.circle_id {
-                            o.send(asker, NodeMessage::FoundPredecessor(id, current_state.predecessor, NodeInfo{id: _id, circle_id:self.circle_id}, successor_asker, add_info))
-                        } else{
-                            match current_state.finger_table.get(&1u16) {
-                                Some(n_successor) => 
+                    Put(request_id, value) => {
+                        let n_value = (request_id as u16).rem_euclid(2u16.pow(3));
+                        o.send(_id, Internal(NodeMessage::FindSuccessor(n_value, None, Some((src, request_id)), None)));
+                    }
+                    Internal(NodeMessage::FindSuccessor(circle_id, asker, register_node, add_info)) => {
+                        o.send(_id, Internal(NodeMessage::FindPredecessor(circle_id, _id,  asker, register_node, add_info)));
+                    }
+                    Internal(NodeMessage::FindPredecessor(id, asker, successor_asker, register_node, add_info)) => {
+                        match current_state.finger_table.get(&1u16) {
+                            Some(n_successor) => 
                                 //was 00
                                 if belongs_clockwise01(id, self.circle_id, n_successor.circle_id, 3){
-                                    o.send(asker, NodeMessage::FoundPredecessor(id, NodeInfo{id: _id, circle_id:self.circle_id}, *n_successor, successor_asker, add_info))
+                                    o.send(asker, Internal(NodeMessage::FoundPredecessor(id, NodeInfo{id: _id, circle_id:self.circle_id}, *n_successor, successor_asker, register_node, add_info)))
                                 } else {
                                     let info = self.closest_preceding_finger(_id, id, 3, &current_state.finger_table);
                                     o.send(info.id, msg)
                                 }
-                                None => {
+                            None => {
                                     let n: Option<NodeState> = None; 
                                     *mut_state = n;
-                                } 
-                            }
+                            } 
                         }
                     }
-                    NodeMessage::FoundPredecessor(_, predecessor, predecessor_successor, asker, add_info) => {
-                        if let Some(ask) = asker {
-                            o.send(ask, NodeMessage::Successor(predecessor_successor, predecessor, add_info));
+                    Internal(NodeMessage::FoundPredecessor(_, predecessor, predecessor_successor, successor_asker, register_node, add_info)) => {
+                        if let Some(asker) = successor_asker {
+                            o.send(asker, Internal(NodeMessage::FoundSuccessor(predecessor_successor, predecessor, add_info)));
+                        }
+                        if let Some(r_asker) = register_node {
+                            o.send(r_asker.0, PutOk(r_asker.1));
                         }
                     }
                     _ => {}
@@ -201,30 +214,79 @@ mod test {
                 (),
                 ()
             )
-            .actor(NodeActor { bootstrap: Some((Id::from(0), NodeMessage::FindPredecessor(0, Id::from(0), None, None))), circle_id: 0, 
+            .actor(RegisterActor::Server(NodeActor {circle_id: 0, 
                 init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(2), circle_id:3},
                 finger_table: a0
             })
-            })
-            .actor(NodeActor { bootstrap: None, circle_id: 1,
+            }))
+            .actor(RegisterActor::Server(NodeActor { circle_id: 1,
                 init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(0), circle_id:0},
                 finger_table: a1
             })
-            })
-            .actor(NodeActor { bootstrap: None, circle_id: 3,
+            }))
+            .actor(RegisterActor::Server(NodeActor { circle_id: 3,
                 init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(1), circle_id:1},
                 finger_table: a3
             })
-            })
+            }))
+            .actors((0..1)
+                    .map(|_| RegisterActor::Client {
+                        put_count: 1,
+                        server_count: 3,
+                    }))
             // .property(Expectation::Always, "linearizable", |_, state| {
             //     state.history.serialized_history().is_some()
             // })
-            .property(Expectation::Sometimes, "find succeeds", |_, state| {
-                let c = state.network.len();
-                print!("wow {}", c);
+            //проверить, что на все запросы правильно ответили
+            //все ft указывают на верные ноды
+            .property(Expectation::Sometimes, "find succeeds", |model, state| {
+                //let c = state.network.len();
+                let actors = &model.actors;
+                let mut actors_vec: Vec<u16> = Vec::new();
+                for a in actors.iter() {
+                    match a {
+                        RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {
+                            actors_vec.push(*id);
+                        }
+                        _ => {}
+                    }
+                }
+                let actor_states = &state.actor_states;
+                let mut actors_ft: Vec<Vec<&NodeInfo>> = Vec::new();
+                let mut i = 0;
+                for state in actor_states.iter() {
+                    match &**state {
+                        RegisterActorState::Server(Some(NodeState{predecessor:p, behavior:_, finger_table:ft})) => 
+                        {
+                            let finger_list = Vec::from_iter(ft.values());
+                            let predecessor = p.circle_id;
+                            let successor = finger_list[0].circle_id;
+                            if i==0 {
+                                print!("predecessor {}", predecessor == actors_vec[actors_vec.len()-1]);
+                            } else {
+                                print!("predecessor {}", predecessor == actors_vec[i-1]);
+                            }
+                            if i==(actors_vec.len()-1) {
+                                print!("successor {}", successor == actors_vec[0]);
+                            } else {
+                                print!("successor {}", successor == actors_vec[i+1]);
+                            }
+                            actors_ft.push(finger_list);
+                        }
+                        _ => {}
+                    }
+                    i +=1;
+                }
+                // for (ft_vec1, ft_vec2) in actors_ft.iter().zip(actors_ft.iter().skip(1).chain(actors_ft.iter().take(1))) {
+                //     for (info1, info2) in (ft_vec1.iter().skip(1)).zip(ft_vec2.iter().take(ft_vec2.len()-1)){
+                //         print!("ft {} {}", info1.circle_id, info2.circle_id)
+                //     }
+                // }
+                print!("\n");
                 state.network.iter_deliverable()
-                    .any(|e| matches!(e.msg, NodeMessage::FoundPredecessor(_, _, _, _, _)/*NodeMessage::FoundPredecessor(6, NodeInfo{refId: _, circleId: 3}, NodeInfo{refId: _, circleId: 0}, _, _)*/))
+                    .all(|e| matches!(e.msg, Internal(NodeMessage::FoundPredecessor(_, _, _, _, _, _))))
             })
+            //.init_network(Network::new_ordered([]))
             // .record_msg_in(RegisterMsg::record_returns)
             // .record_msg_out(RegisterMsg::record_invocations)
             .checker().spawn_dfs().join();
@@ -244,62 +306,6 @@ mod test {
         // ]);
     }
 }
-
-
-// #[cfg(test)]
-// mod test {
-//     use super::*;
-//     use stateright::{*, semantics::*, semantics::register::*};
-//     use ActorModelAction::Deliver;
-//     use RegisterMsg::{Get, GetOk, Put, PutOk};
-
-//     #[test]
-//     fn could_find_predecessor() {
-//         let checker = ActorModel::new(
-//                 (),
-//                 ()
-//             )
-//             .actor(NodeActor { bootstrap_to_id: Some(Id::from(0)), myId: 0, 
-//                 init: None
-//             })
-//             .actor(NodeActor { bootstrap_to_id: None, myId: 1,
-//                 init: None
-//             })
-//             .actor(NodeActor { bootstrap_to_id: None, myId: 3,
-//                 init: None
-//             })
-//             // .actor(RegisterActor::Server(ServerActor))
-//             // .actor(RegisterActor::Client { put_count: 2, server_count: 1 })
-//             // .property(Expectation::Always, "linearizable", |_, state| {
-//             //     state.history.serialized_history().is_some()
-//             // })
-//             // .property(Expectation::Sometimes, "get succeeds", |_, state| {
-//             //     state.network.iter_deliverable()
-//             //         .any(|e| matches!(e.msg, RegisterMsg::GetOk(_, _)))
-//             // })
-//             // .property(Expectation::Sometimes, "find succeeds", |_, state| {
-//             //     state.network.iter_deliverable()
-//             //         .any(|e| matches!(e.msg, NodeMessage::FoundPredecessor(_, _, _, _, _)/*NodeMessage::FoundPredecessor(6, NodeInfo{refId: _, circleId: 3}, NodeInfo{refId: _, circleId: 0}, _, _)*/))
-//             // })
-//             // .record_msg_in(RegisterMsg::record_returns)
-//             // .record_msg_out(RegisterMsg::record_invocations)
-//             .checker().spawn_dfs().join();
-//         //checker.assert_properties(); // TRY IT: Uncomment this line, and the test will fail.
-//         // checker.assert_discovery("linearizable", vec![
-//         //     Deliver { src: Id::from(0), dst: Id::from(0), msg: NodeMessage::FindPredecessor(6, Id::from(0), None)},
-
-//         // ]);
-//         // checker.assert_discovery("linearizable", vec![
-//         //     Deliver { src: Id::from(1), dst: Id::from(0), msg: Put(1, 'A') },
-//         //     Deliver { src: Id::from(0), dst: Id::from(1), msg: PutOk(1) },
-//         //     Deliver { src: Id::from(1), dst: Id::from(0), msg: Put(2, 'Z') },
-//         //     Deliver { src: Id::from(0), dst: Id::from(1), msg: PutOk(2) },
-//         //     Deliver { src: Id::from(1), dst: Id::from(0), msg: Put(1, 'A') },
-//         //     Deliver { src: Id::from(1), dst: Id::from(0), msg: Get(3) },
-//         //     Deliver { src: Id::from(0), dst: Id::from(1), msg: GetOk(3, 'A') },
-//         // ]);
-//     }
-// }
 
 fn main() {
     // env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
