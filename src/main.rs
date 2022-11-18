@@ -13,14 +13,15 @@ type FingerId = u16; //1, 2, 3 1<=id<=m
 type RequestId = u64; //для registerActor
 type Value = char; //для registerActor
 
-struct InitializingParams{
-    predecessor: NodeInfo,
-    finger_table: BTreeMap<FingerId, NodeInfo>
+enum InitializingParams{
+    ToJoin,
+    Joined{predecessor: NodeInfo, finger_table: BTreeMap<FingerId, NodeInfo>},
+    ToDie{predecessor: NodeInfo, finger_table: BTreeMap<FingerId, NodeInfo>}
 }
 
 struct NodeActor {
     circle_id: CircleId,
-    init: Option<InitializingParams>
+    init: InitializingParams
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -32,12 +33,24 @@ type RegisterAsker = Id;
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 enum NodeMessage{
+    Stabilize,
+    GetPredecessor,
+    Predecessor(Option<NodeInfo>),
+    Notify(NodeInfo),
+
+    FixFingers,
+
+    StartJoin(
+        Id, //known_node
+        Option<(RegisterAsker, RequestId)> //register_asker
+    ), 
+
     FindPredecessor(
         CircleId, //queried_id
         PredecessorAsker, //asker
         Option<SuccessorAsker>, //successor_asker
         Option<(RegisterAsker, RequestId)>, //register_asker
-        Option<CircleId> //additional info
+        Option<FingerId> //additional info
     ),
     FoundPredecessor(
         CircleId, //queried_id
@@ -45,17 +58,26 @@ enum NodeMessage{
         NodeInfo,//predecessor_successor
         Option<SuccessorAsker>,//successor_asker
         Option<(RegisterAsker, RequestId)>, //register_asker
-        Option<CircleId> //additional info
+        Option<FingerId> //additional info
     ),
 
-    FindSuccessor(CircleId, Option<SuccessorAsker>, Option<(RegisterAsker, RequestId)>, Option<CircleId>),//queried_id, asker, register_node, additional info 
-    FoundSuccessor(NodeInfo, NodeInfo, Option<CircleId>), //result, predecessor, additional info 
+    FindSuccessor(CircleId, Option<SuccessorAsker>, Option<(RegisterAsker, RequestId)>, Option<FingerId>),//queried_id, asker, register_node, additional info 
+    FoundSuccessor(NodeInfo, NodeInfo, Option<FingerId>), //result, predecessor, additional info
+
+    CheckAlive(),
+    IsAlive()
+}
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+enum Behavior{
+    StartedJoin,
+    InternalReceive
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct NodeState{
-    predecessor: NodeInfo,
-    behavior: &'static str,
+    predecessor: Option<NodeInfo>,
+    behavior: Behavior,//&'static str,
     finger_table: BTreeMap<FingerId, NodeInfo>
 }
 
@@ -122,21 +144,101 @@ impl Actor for NodeActor {
     type State = Option<NodeState>;
 
     fn on_start(&self, _id: Id, _o: &mut Out<Self>) -> Self::State {
-        if let Some(init_params) = &self.init {
-            Some(NodeState{
-                predecessor : init_params.predecessor,
-                behavior : &"internalReceive",
-                finger_table : init_params.finger_table.clone()
-            })
-        } else {None}
+        match &self.init {
+            InitializingParams::ToJoin => {None}
+            InitializingParams::Joined{predecessor: init_predecessor, finger_table: init_finger_table}|
+            InitializingParams::ToDie{predecessor: init_predecessor, finger_table: init_finger_table}
+            => {
+                _o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                Some(NodeState{
+                    predecessor : Some(*init_predecessor),
+                    behavior : Behavior::InternalReceive,
+                    finger_table : (*init_finger_table).clone()
+                })
+            }
+        }
+    }
+
+    fn on_timeout(
+        &self,
+        id: Id,
+        state: &mut Cow<'_, Self::State>,
+        o: &mut Out<Self>
+    ){
+        o.send(id, Internal(NodeMessage::Stabilize));
+        o.send(id, Internal(NodeMessage::FixFingers));
+        o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0));
     }
 
     fn on_msg(&self, _id: Id, state: &mut Cow<Self::State>,
               src: Id, msg: Self::Msg, o: &mut Out<Self>) {
         let mut_state = state.to_mut();
-        if let Some(current_state) = mut_state {
+        if let Some(current_state) = mut_state.as_mut() {
             match current_state.behavior {
-                "internalReceive" => match msg {
+                Behavior::StartedJoin => match msg {
+                    Internal(NodeMessage::StartJoin(id, register_asker)) => 
+                        {
+                            o.send(id, Internal(
+                                NodeMessage::FindPredecessor(self.circle_id, _id, None, register_asker, None)
+                            ))
+                        }
+                    Internal(NodeMessage::FoundPredecessor(_, predecessor, predecessor_successor, _, register_node, _)) =>
+                        {
+                            current_state.predecessor = Some(predecessor);
+                            current_state.finger_table.insert(1, predecessor_successor);
+                            current_state.behavior = Behavior::InternalReceive;
+                            o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                            if let Some(r_asker) = register_node {
+                                o.send(r_asker.0, PutOk(r_asker.1));
+                            }
+                        }
+                    _ => {}
+                }
+                Behavior::InternalReceive => match msg {
+                    Internal(NodeMessage::FixFingers) => {
+                        let mut rng = rand::thread_rng();
+                        let i = rng.gen_range(1..3) + 1; //2, 3
+                        let start_circle_id = finger_start(self.circle_id, i, 3);
+                        o.send(_id,
+                            Internal(NodeMessage::FindSuccessor(start_circle_id, Some(_id), None, Some(i))));
+                    }
+                    Internal(NodeMessage::FoundSuccessor(successor, _, Some(i))) =>{
+                        current_state.finger_table.insert(i, successor);
+                    }
+
+                    Internal(NodeMessage::Stabilize) => {
+                        let successor: NodeInfo = current_state.finger_table[&1];
+                        o.send(successor.id, Internal(NodeMessage::GetPredecessor));
+                    }
+                    Internal(NodeMessage::GetPredecessor) => {
+                        o.send(src, Internal(NodeMessage::Predecessor(current_state.predecessor)));
+                    }
+                    Internal(NodeMessage::Predecessor(predecessorOpt)) => {
+                        let successor: NodeInfo = current_state.finger_table[&1];
+                        if let Some(predecessor) = predecessorOpt{
+                            if belongs_clockwise00(predecessor.circle_id, self.circle_id, successor.circle_id, 3){
+                                current_state.finger_table.insert(1, predecessor);
+                                o.send(predecessor.id, 
+                                    Internal(NodeMessage::Notify(NodeInfo{id:_id, circle_id:self.circle_id})));
+                            } else {
+                                o.send(successor.id, 
+                                    Internal(NodeMessage::Notify(NodeInfo{id:_id, circle_id:self.circle_id})));
+                            }
+                        } else {
+                            o.send(successor.id, 
+                                Internal(NodeMessage::Notify(NodeInfo{id:_id, circle_id:self.circle_id})));
+                        }
+                    }
+                    Internal(NodeMessage::Notify(maybe_predecessor)) => {
+                        if let Some(pred) = current_state.predecessor{
+                            if belongs_clockwise00(maybe_predecessor.circle_id, pred.circle_id, self.circle_id, 3){
+                                current_state.predecessor = Some(maybe_predecessor);
+                            }
+                        } else {
+                            current_state.predecessor = Some(maybe_predecessor);
+                        }
+                    }
+
                     //сделать так, чтобы значение правда хранилось
                     Get(request_id) => {
                         o.send(src, GetOk(request_id, 'A'));
@@ -151,7 +253,6 @@ impl Actor for NodeActor {
                     Internal(NodeMessage::FindPredecessor(id, asker, successor_asker, register_node, add_info)) => {
                         match current_state.finger_table.get(&1u16) {
                             Some(n_successor) => 
-                                //was 00
                                 if belongs_clockwise01(id, self.circle_id, n_successor.circle_id, 3){
                                     o.send(asker, Internal(NodeMessage::FoundPredecessor(id, NodeInfo{id: _id, circle_id:self.circle_id}, *n_successor, successor_asker, register_node, add_info)))
                                 } else {
@@ -159,8 +260,7 @@ impl Actor for NodeActor {
                                     o.send(info.id, msg)
                                 }
                             None => {
-                                    let n: Option<NodeState> = None; 
-                                    *mut_state = n;
+                                    *mut_state = None;
                             } 
                         }
                     }
@@ -176,7 +276,19 @@ impl Actor for NodeActor {
                 }
                 _ => {}
             }
-        } else {}
+        } else {
+            match msg {
+                Put(request_id, _) => {
+                    *mut_state = Some(NodeState{
+                        predecessor : None,
+                        behavior : Behavior::StartedJoin,
+                        finger_table : BTreeMap::new()
+                    });
+                    o.send(_id, Internal(NodeMessage::StartJoin(Id::from(0), Some((src, request_id)))));
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -197,7 +309,7 @@ mod test {
     use RegisterMsg::{Get, GetOk, Put, PutOk};
 
     #[test]
-    fn could_find_predecessor() {
+    fn check_Chord() {
         let mut a0 = BTreeMap::new();
         a0.insert(1, NodeInfo{id: Id::from(1), circle_id:1});
         a0.insert(2, NodeInfo{id: Id::from(2), circle_id:3});
@@ -210,87 +322,114 @@ mod test {
         a3.insert(1, NodeInfo{id: Id::from(0), circle_id:0});
         a3.insert(2, NodeInfo{id: Id::from(0), circle_id:0});
         a3.insert(3, NodeInfo{id: Id::from(0), circle_id:0});
-        let checker = ActorModel::new(
+        let model = ActorModel::new(
                 (),
                 ()
             )
             .actor(RegisterActor::Server(NodeActor {circle_id: 0, 
-                init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(2), circle_id:3},
+                init: InitializingParams::Joined{predecessor: NodeInfo{id: Id::from(2), circle_id:3},
                 finger_table: a0
-            })
+            }
             }))
             .actor(RegisterActor::Server(NodeActor { circle_id: 1,
-                init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(0), circle_id:0},
+                init: InitializingParams::Joined{predecessor: NodeInfo{id: Id::from(0), circle_id:0},
                 finger_table: a1
-            })
+            }
             }))
             .actor(RegisterActor::Server(NodeActor { circle_id: 3,
-                init: Some(InitializingParams{predecessor: NodeInfo{id: Id::from(1), circle_id:1},
+                init: InitializingParams::Joined{predecessor: NodeInfo{id: Id::from(1), circle_id:1},
                 finger_table: a3
-            })
+            }
             }))
+            .actor(RegisterActor::Server(NodeActor { circle_id: 6,
+                init: InitializingParams::ToJoin,
+            }  
+            ))
+            .actor(RegisterActor::Server(NodeActor { circle_id: 7,
+                init: InitializingParams::ToJoin,
+            }  
+            ))
             .actors((0..1)
                     .map(|_| RegisterActor::Client {
-                        put_count: 1,
-                        server_count: 3,
+                        put_count: 5,
+                        server_count: 5,
                     }))
-            // .property(Expectation::Always, "linearizable", |_, state| {
-            //     state.history.serialized_history().is_some()
-            // })
-            //проверить, что на все запросы правильно ответили
-            //все ft указывают на верные ноды
-            .property(Expectation::Sometimes, "find succeeds", |model, state| {
-                //let c = state.network.len();
-                let actors = &model.actors;
-                let mut actors_vec: Vec<u16> = Vec::new();
-                for a in actors.iter() {
-                    match a {
-                        RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {
-                            actors_vec.push(*id);
-                        }
-                        _ => {}
-                    }
-                }
+            //все ft указывают на верные ноды?
+            .property(Expectation::Eventually, "is always Ideal", |model, state| {
+                let actors_circle_ids = &model.actors.iter().flat_map(|a| match a {
+                    RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {vec![id]}
+                    _ => {vec![]}
+                }).collect::<Vec<&u16>>();
+                let actors_nonempty_states_indexes = &state.actor_states.iter().enumerate().flat_map(|(i, state)| match &**state{
+                    RegisterActorState::Server(Some(_)) => {vec![i]}
+                    _ => {vec![]} 
+                }).collect::<Vec<usize>>();
+                print!("wow {}\n", actors_nonempty_states_indexes.len());
+                let actors_vec = actors_circle_ids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| actors_nonempty_states_indexes.contains(i))
+                .map(|(_, id)| **id).collect::<Vec<u16>>();
                 let actor_states = &state.actor_states;
-                let mut actors_ft: Vec<Vec<&NodeInfo>> = Vec::new();
                 let mut i = 0;
+                let mut result = true;
                 for state in actor_states.iter() {
                     match &**state {
                         RegisterActorState::Server(Some(NodeState{predecessor:p, behavior:_, finger_table:ft})) => 
                         {
+                            if let Some(pred) = p {
+                                print!("i {}\n", i);
+                                let predecessor = pred.circle_id;
+                                print!("pred {}\n", predecessor);
+                                if i==0 {
+                                    result = result && predecessor == actors_vec[actors_vec.len()-1];
+                                    print!("res {}\n", result);
+                                    print!("actor {}\n", actors_vec[actors_vec.len()-1]);
+                                } else {
+                                    result = result && predecessor == actors_vec[i-1];
+                                    print!("res {}\n", result);
+                                    print!("actor {}\n", actors_vec[i-1]);
+                                }
+                            } else {result = false;}
                             let finger_list = Vec::from_iter(ft.values());
-                            let predecessor = p.circle_id;
-                            let successor = finger_list[0].circle_id;
-                            if i==0 {
-                                print!("predecessor {}", predecessor == actors_vec[actors_vec.len()-1]);
-                            } else {
-                                print!("predecessor {}", predecessor == actors_vec[i-1]);
-                            }
-                            if i==(actors_vec.len()-1) {
-                                print!("successor {}", successor == actors_vec[0]);
-                            } else {
-                                print!("successor {}", successor == actors_vec[i+1]);
-                            }
-                            actors_ft.push(finger_list);
+                            if finger_list.len()>0{
+                                let successor = finger_list[0].circle_id;
+                                if i==(actors_vec.len()-1) {
+                                    result = result && successor == actors_vec[0];
+                                } else {
+                                    result = result && successor == actors_vec[i+1];
+                                }
+                            } else {result = false;}
+                            // let mut int_i = 1;
+                            // for entry in finger_list.iter(){
+                            //     let start = finger_start(actors_vec[i], int_i, 3);
+                            //     let real_succ = actors_vec.iter().find(|&&id| id>= start);
+                            // }
                         }
                         _ => {}
                     }
                     i +=1;
                 }
-                // for (ft_vec1, ft_vec2) in actors_ft.iter().zip(actors_ft.iter().skip(1).chain(actors_ft.iter().take(1))) {
-                //     for (info1, info2) in (ft_vec1.iter().skip(1)).zip(ft_vec2.iter().take(ft_vec2.len()-1)){
-                //         print!("ft {} {}", info1.circle_id, info2.circle_id)
-                //     }
-                // }
-                print!("\n");
+                print!("evevn res {}\n", result);
+                result
+            })
+            //проверить, что на все запросы правильно ответили
+            .property(Expectation::Always, "finds success", |model, state| {
                 state.network.iter_deliverable()
-                    .all(|e| matches!(e.msg, Internal(NodeMessage::FoundPredecessor(_, _, _, _, _, _))))
+                    .any(|e| matches!(e.msg, Internal(NodeMessage::FoundPredecessor(_, _, _, _, _, _))))
+            })
+            .property(Expectation::Sometimes, "joins", |model, state| {
+                state.network.iter_deliverable()
+                    .any(|e| matches!(e.msg, Internal(NodeMessage::StartJoin(_, _))))
             })
             //.init_network(Network::new_ordered([]))
             // .record_msg_in(RegisterMsg::record_returns)
             // .record_msg_out(RegisterMsg::record_invocations)
-            .checker().spawn_dfs().join();
-        checker.assert_properties(); // TRY IT: Uncomment this line, and the test will fail.
+            ;
+        //model.as_svg(path: Path<Self::State, Self::Action>);
+        //let checker = model.checker();
+        //let _ = model.checker().serve("localhost:3000");
+        model.checker().target_state_count(470).spawn_bfs().join().assert_properties(); // TRY IT: Uncomment this line, and the test will fail.
         // checker.assert_discovery("linearizable", vec![
         //     Deliver { src: Id::from(0), dst: Id::from(0), msg: NodeMessage::FindPredecessor(6, Id::from(0), None)},
 
