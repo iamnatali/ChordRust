@@ -3,11 +3,9 @@ use std::borrow::Cow;
 use std::net::{SocketAddrV4, Ipv4Addr};
 use std::collections::BTreeMap;
 use rand::Rng;
-use stateright::actor::register::{
-    RegisterActor, RegisterMsg, RegisterMsg::*};
-use std::sync::Arc;
+use stateright::actor::register::{RegisterActor, RegisterMsg, RegisterMsg::*};
 
-//Id - тип по которому можно обращаться
+//Id - для send
 type CircleId = u16; //123435, 32432434 (зашит хэш ip)
 type FingerId = u16; //1, 2, 3 1<=id<=m
 type RequestId = u64; //для registerActor
@@ -24,7 +22,7 @@ struct NodeActor {
     init: InitializingParams
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 struct NodeInfo {id: Id, circle_id: CircleId}
 
 type PredecessorAsker = Id;
@@ -148,8 +146,7 @@ impl Actor for NodeActor {
             InitializingParams::Joined{predecessor: init_predecessor, finger_table: init_finger_table}|
             InitializingParams::ToDie{predecessor: init_predecessor, finger_table: init_finger_table}
             => {
-                _o.set_timer(model_timeout());
-                //_o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                _o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
                 Some(NodeState{
                     predecessor : Some(*init_predecessor),
                     behavior : Behavior::InternalReceive,
@@ -167,8 +164,7 @@ impl Actor for NodeActor {
     ){
         o.send(id, Internal(NodeMessage::Stabilize));
         o.send(id, Internal(NodeMessage::FixFingers));
-        o.set_timer(model_timeout());
-        //o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0));
+        o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0));
     }
 
     fn on_msg(&self, _id: Id, state: &mut Cow<Self::State>,
@@ -193,8 +189,7 @@ impl Actor for NodeActor {
                             current_state.predecessor = Some(predecessor);
                             current_state.finger_table.insert(1, predecessor_successor);
                             current_state.behavior = Behavior::InternalReceive;
-                            o.set_timer(model_timeout()); 
-                            //o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                            o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
                             if let Some(r_asker) = register_node {
                                 o.send(r_asker.0, PutOk(r_asker.1));
                             }
@@ -236,7 +231,7 @@ impl Actor for NodeActor {
                 Behavior::InternalReceive => match msg {
                     Internal(NodeMessage::FixFingers) => {
                         let mut rng = rand::thread_rng();
-                        let i = 2;//rng.gen_range(1..3) + 1; //2, 3
+                        let i = 2;//rng.gen_range(1..3) + 1;
                         let start_circle_id = finger_start(self.circle_id, i, 3);
                         current_state.behavior = Behavior::FixFingersFoundSuccessor;
                         o.send(_id,
@@ -261,7 +256,6 @@ impl Actor for NodeActor {
                         }
                     }
 
-                    //сделать так, чтобы значение действительно хранилось
                     Get(request_id) => {
                         o.send(src, GetOk(request_id, 'A'));
                     }
@@ -326,9 +320,7 @@ impl Actor for NodeActor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use stateright::{*, semantics::*, semantics::register::*};
-    use ActorModelAction::Deliver;
-    use RegisterMsg::{Get, GetOk, Put, PutOk};
+    use stateright::{*};
 
     #[test]
     fn check_chord() {
@@ -372,7 +364,6 @@ mod test {
                         put_count: 3,
                         server_count: 3,
                     }))
-            //проверить, что все ft eventually указывают на верные ноды
             .property(Expectation::Eventually, "is eventually Ideal", |model, state| {
                 let actors_circle_ids = &model.actors.iter().flat_map(|a| match a {
                     RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {vec![id]}
@@ -396,17 +387,11 @@ mod test {
                         RegisterActorState::Server(Some(NodeState{predecessor:p, behavior:_, finger_table:ft})) => 
                         {
                             if let Some(pred) = p {
-                                print!("i {}\n", i);
                                 let predecessor = pred.circle_id;
-                                print!("pred {}\n", predecessor);
                                 if i==0 {
                                     result = result && predecessor == actors_vec[actors_vec.len()-1];
-                                    print!("res {}\n", result);
-                                    print!("actor {}\n", actors_vec[actors_vec.len()-1]);
                                 } else {
                                     result = result && predecessor == actors_vec[i-1];
-                                    print!("res {}\n", result);
-                                    print!("actor {}\n", actors_vec[i-1]);
                                 }
                             } else {result = false;}
                             let finger_list = Vec::from_iter(ft.values());
@@ -418,31 +403,20 @@ mod test {
                                     result = result && successor == actors_vec[i+1];
                                 }
                             } else {result = false;}
-                            // let mut int_i = 1;
-                            // for entry in finger_list.iter(){
-                            //     let start = finger_start(actors_vec[i], int_i, 3);
-                            //     let real_succ = actors_vec.iter().find(|&&id| id>= start);
-                            // }
                         }
                         _ => {}
                     }
                     i +=1;
                 }
-                print!("evevn res {}\n", result);
                 false
-            })//;
-            //проверить, что на все запросы правильно ответили
-            // .property(Expectation::Always, "finds success", |model, state| {
-            //     state.network.iter_deliverable()
-            //         .any(|e| matches!(e.msg, Internal(NodeMessage::FoundPredecessor(_, _, _, _, _, _))))
-            // })
+            })
             .property(Expectation::Sometimes, "joins", |model, state| {
                 state.network.iter_deliverable()
                     .any(|e| matches!(e.msg, Internal(NodeMessage::StartJoin(_, _))))
             });
         //let _ = model.checker().serve("localhost:3000").assert_properties();
+        //target_state_count
         model.checker()
-        //.target_state_count(10)
         .spawn_bfs()
         .report(&mut std::io::stdout().lock())
         .join()
