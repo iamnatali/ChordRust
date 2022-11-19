@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use rand::Rng;
 use stateright::actor::register::{
     RegisterActor, RegisterMsg, RegisterMsg::*};
-use std::sync::Arc;
 
 //Id - тип по которому можно обращаться
 type CircleId = u16; //123435, 32432434 (зашит хэш ip)
@@ -24,7 +23,7 @@ struct NodeActor {
     init: InitializingParams
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 struct NodeInfo {id: Id, circle_id: CircleId}
 
 type PredecessorAsker = Id;
@@ -143,13 +142,17 @@ impl Actor for NodeActor {
     fn on_start(&self, _id: Id, _o: &mut Out<Self>) -> Self::State {
         match &self.init {
             InitializingParams::ToJoin => {
-                None
+                _o.set_timer(model_timeout());
+                Some(NodeState{
+                    predecessor : None,
+                    behavior : Behavior::StartJoin,
+                    finger_table : BTreeMap::new(),
+                })
             }
             InitializingParams::Joined{predecessor: init_predecessor, finger_table: init_finger_table}|
             InitializingParams::ToDie{predecessor: init_predecessor, finger_table: init_finger_table}
             => {
-                _o.set_timer(model_timeout());
-                //_o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                _o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
                 Some(NodeState{
                     predecessor : Some(*init_predecessor),
                     behavior : Behavior::InternalReceive,
@@ -166,9 +169,8 @@ impl Actor for NodeActor {
         o: &mut Out<Self>
     ){
         o.send(id, Internal(NodeMessage::Stabilize));
-        o.send(id, Internal(NodeMessage::FixFingers));
-        o.set_timer(model_timeout());
-        //o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0));
+        //o.send(id, Internal(NodeMessage::FixFingers));
+        o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0));
     }
 
     fn on_msg(&self, _id: Id, state: &mut Cow<Self::State>,
@@ -176,15 +178,12 @@ impl Actor for NodeActor {
         let mut_state = state.to_mut();
         if let Some(current_state) = mut_state.as_mut() {
             match current_state.behavior {
-                Behavior::StartJoin => match msg {
-                    Internal(NodeMessage::StartJoin(id, register_asker)) => 
-                        {
-                            current_state.behavior = Behavior::StartJoinFoundPredecessor;
-                            o.send(id, Internal(
-                                NodeMessage::FindPredecessor(self.circle_id, _id, None, register_asker, None)
+                Behavior::StartJoin => 
+                {
+                    current_state.behavior = Behavior::StartJoinFoundPredecessor;
+                    o.send(Id::from(0), Internal(
+                                NodeMessage::FindPredecessor(self.circle_id, _id, None, None, None)
                             ))
-                        }
-                    _ => {}
                 }
                 Behavior::StartJoinFoundPredecessor => {
                     match msg {
@@ -193,8 +192,7 @@ impl Actor for NodeActor {
                             current_state.predecessor = Some(predecessor);
                             current_state.finger_table.insert(1, predecessor_successor);
                             current_state.behavior = Behavior::InternalReceive;
-                            o.set_timer(model_timeout()); 
-                            //o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
+                            o.set_timer(std::time::Duration::new(5, 0) .. std::time::Duration::new(10, 0)); 
                             if let Some(r_asker) = register_node {
                                 o.send(r_asker.0, PutOk(r_asker.1));
                             }
@@ -272,10 +270,12 @@ impl Actor for NodeActor {
                                 o.cancel_timer();
                                 o.send(src, PutOk(request_id));
                             }
-                            _ => {o.send(src, PutOk(request_id));}
+                            _ => {
+                                let n_value = (request_id as u16).rem_euclid(2u16.pow(3));
+                                o.send(src, PutOk(request_id));
+                                //o.send(_id, Internal(NodeMessage::FindSuccessor(n_value, None, Some((src, request_id)), None)));
+                            }
                         }
-                        //let n_value = (request_id as u16).rem_euclid(2u16.pow(3));
-                        //o.send(_id, Internal(NodeMessage::FindSuccessor(5, None, Some((src, request_id)), None)));
                     }
                     Internal(NodeMessage::FindSuccessor(circle_id, asker, register_node, add_info)) => {
                         o.send(_id, Internal(NodeMessage::FindPredecessor(circle_id, _id,  asker, register_node, add_info)));
@@ -306,18 +306,6 @@ impl Actor for NodeActor {
                 }
                 _ => {}
             }
-        } else {
-            match msg {
-                Put(request_id, _) => {
-                    *mut_state = Some(NodeState{
-                        predecessor : None,
-                        behavior : Behavior::StartJoin,
-                        finger_table : BTreeMap::new(),
-                    });
-                    o.send(_id, Internal(NodeMessage::StartJoin(Id::from(0), Some((src, request_id)))));
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -326,9 +314,7 @@ impl Actor for NodeActor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use stateright::{*, semantics::*, semantics::register::*};
-    use ActorModelAction::Deliver;
-    use RegisterMsg::{Get, GetOk, Put, PutOk};
+    use stateright::{*};
 
     #[test]
     fn check_chord() {
@@ -359,7 +345,7 @@ mod test {
             }
             }))
             .actor(RegisterActor::Server(NodeActor { circle_id: 3,
-                init: InitializingParams::ToDie{predecessor: NodeInfo{id: Id::from(1), circle_id:1},
+                init: InitializingParams::Joined{predecessor: NodeInfo{id: Id::from(1), circle_id:1},
                 finger_table: a3
             }
             }))
@@ -369,25 +355,14 @@ mod test {
             ))
             .actors((0..1)
                     .map(|_| RegisterActor::Client {
-                        put_count: 3,
-                        server_count: 3,
+                        put_count: 4,
+                        server_count: 4,
                     }))
-            //проверить, что все ft eventually указывают на верные ноды
-            .property(Expectation::Eventually, "is eventually Ideal", |model, state| {
-                let actors_circle_ids = &model.actors.iter().flat_map(|a| match a {
-                    RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {vec![id]}
+            .property(Expectation::Sometimes, "is sometimes Ideal", |model, state| {
+                let actors_circle_id = &model.actors.iter().flat_map(|a| match a {
+                    RegisterActor::Server(NodeActor{circle_id: id, init: _}) => {vec![*id]}
                     _ => {vec![]}
-                }).collect::<Vec<&u16>>();
-                let actors_nonempty_states_indexes = &state.actor_states.iter().enumerate().flat_map(|(i, state)| match &**state{
-                    RegisterActorState::Server(Some(_)) => {vec![i]}
-                    _ => {vec![]} 
-                }).collect::<Vec<usize>>();
-                print!("wow {}\n", actors_nonempty_states_indexes.len());
-                let actors_vec = actors_circle_ids
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| actors_nonempty_states_indexes.contains(i))
-                .map(|(_, id)| **id).collect::<Vec<u16>>();
+                }).collect::<Vec<u16>>();
                 let actor_states = &state.actor_states;
                 let mut i = 0;
                 let mut result = true;
@@ -396,53 +371,32 @@ mod test {
                         RegisterActorState::Server(Some(NodeState{predecessor:p, behavior:_, finger_table:ft})) => 
                         {
                             if let Some(pred) = p {
-                                print!("i {}\n", i);
                                 let predecessor = pred.circle_id;
-                                print!("pred {}\n", predecessor);
                                 if i==0 {
-                                    result = result && predecessor == actors_vec[actors_vec.len()-1];
-                                    print!("res {}\n", result);
-                                    print!("actor {}\n", actors_vec[actors_vec.len()-1]);
+                                    result = result && predecessor == actors_circle_id[actors_circle_id.len()-1];
                                 } else {
-                                    result = result && predecessor == actors_vec[i-1];
-                                    print!("res {}\n", result);
-                                    print!("actor {}\n", actors_vec[i-1]);
+                                    result = result && predecessor == actors_circle_id[i-1];
                                 }
                             } else {result = false;}
                             let finger_list = Vec::from_iter(ft.values());
                             if finger_list.len()>0{
                                 let successor = finger_list[0].circle_id;
-                                if i==(actors_vec.len()-1) {
-                                    result = result && successor == actors_vec[0];
+                                if i==(actors_circle_id.len()-1) {
+                                    result = result && successor == actors_circle_id[0];
                                 } else {
-                                    result = result && successor == actors_vec[i+1];
+                                    result = result && successor == actors_circle_id[i+1];
                                 }
                             } else {result = false;}
-                            // let mut int_i = 1;
-                            // for entry in finger_list.iter(){
-                            //     let start = finger_start(actors_vec[i], int_i, 3);
-                            //     let real_succ = actors_vec.iter().find(|&&id| id>= start);
-                            // }
                         }
                         _ => {}
                     }
                     i +=1;
                 }
-                print!("evevn res {}\n", result);
-                false
-            })//;
-            //проверить, что на все запросы правильно ответили
-            // .property(Expectation::Always, "finds success", |model, state| {
-            //     state.network.iter_deliverable()
-            //         .any(|e| matches!(e.msg, Internal(NodeMessage::FoundPredecessor(_, _, _, _, _, _))))
-            // })
-            .property(Expectation::Sometimes, "joins", |model, state| {
-                state.network.iter_deliverable()
-                    .any(|e| matches!(e.msg, Internal(NodeMessage::StartJoin(_, _))))
+                result
             });
         //let _ = model.checker().serve("localhost:3000").assert_properties();
-        model.checker()
         //.target_state_count(10)
+        model.checker()
         .spawn_bfs()
         .report(&mut std::io::stdout().lock())
         .join()

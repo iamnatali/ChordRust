@@ -682,6 +682,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "rand 0.8.5",
+ "serde",
  "serde_json",
  "stateright",
 ]
