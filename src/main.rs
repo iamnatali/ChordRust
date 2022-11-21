@@ -408,7 +408,7 @@ mod test {
                     }
                     i +=1;
                 }
-                false
+                result
             })
             .property(Expectation::Sometimes, "joins", |model, state| {
                 state.network.iter_deliverable()
